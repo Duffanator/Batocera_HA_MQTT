@@ -1,0 +1,729 @@
+#!/bin/bash
+# Batocera MQTT bridge (boxart + marquee + CPU-only telemetry pinned to HWMON:temp)
+# Initially from kit on Batocera Discord
+# - CPU temp:
+#   * Median-of-samples + sticky + last-good + hard range guards.
+#   * Cached temp*_input path to avoid flicks and rescan churn.
+# - Home Assistant MQTT discovery:
+#   * Image: Box Art + Marquee (no YAML).
+#   * Sensors: cpu_temp (+source/status), cpu_load, ram_used, disk_used, uptime.
+# - Debug topic: batocera/<host>/media_debug
+ 
+######################################
+# Broker / topics
+######################################
+MQTT_HOST=""     # Broker IP
+MQTT_PORT="1883"     # Broker Port (usually 1883)
+MQTT_USER=""     # username
+MQTT_PASSWORD="" # Password
+ 
+DISCOVERY_PREFIX="homeassistant"
+HOSTNAME="$(hostname)"
+MQTT_BASE_TOPIC="batocera/${HOSTNAME}"
+ 
+# Telemetry
+TELEMETRY_ENABLE=1
+TELEMETRY_INTERVAL=5
+ 
+# Media behavior
+RETAIN_MEDIA_BYTES=1
+PUBLISH_IMAGE_B64=1
+ 
+# Paths / cache
+PIDFILE="/var/run/mqtt_events.pid"
+TMP_DIR="/tmp/mqtt_media"
+mkdir -p "$TMP_DIR"
+CORETEMP_PATH_CACHE="/tmp/mqtt_events_coretemp_path"
+CPU_TEMP_STATE_FILE="/tmp/mqtt_events_cpu_temp_state"
+ 
+# jq detection (optional)
+HAS_JQ=0
+command -v jq >/dev/null 2>&1 && HAS_JQ=1
+ 
+######################################
+# ES service
+######################################
+SERVICE_NAME=$(basename "$0")
+ES_EVENTS=(game-start game-end game-selected system-selected theme-changed settings-changed controls-changed config-changed quit reboot shutdown sleep wake achievements screensaver-start screensaver-stop)
+ 
+######################################
+# Helpers
+######################################
+_ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
+_local_ts() { date +"%d/%m/%Y %H:%M:%S"; }
+ 
+_json_array_from_args() {
+  if [ "$HAS_JQ" -eq 1 ]; then
+    local arr="["
+    for arg in "$@"; do
+      arr+=$(jq -Rn --arg a "$arg" '$a')
+      arr+=","
+    done
+    echo "${arr%,}]"
+  else
+    local arr="["
+    for arg in "$@"; do arr+="\"${arg//\"/\\\"}\","; done
+    echo "${arr%,}]"
+  fi
+}
+ 
+# Retained publishers
+_pub() { mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASSWORD" -t "$1" -m "$2" -r; }
+_pub_str() { _pub "$1" "$2"; }
+ 
+# Non-retained
+_pub_event() { mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASSWORD" -t "$1" -m "$2"; }
+ 
+# File publisher (bytes)
+_pub_file() {
+  [ -f "$2" ] || return 1
+  local args=(-h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASSWORD" -t "$1" -f "$2")
+  [ "$RETAIN_MEDIA_BYTES" -eq 1 ] && args+=(-r)
+  mosquitto_pub "${args[@]}"
+}
+ 
+_dbg() { _pub_event "${MQTT_BASE_TOPIC}/media_debug" "$1"; }
+ 
+######################################
+# Startup cleanup: purge any old GPU retained topics/entities
+# Unused, kept as an example for clearing out entities
+######################################
+_clear_legacy_gpu_topics() {
+  local ID="batocera_${HOSTNAME}"
+  # HA discovery (GPU)
+  for t in \
+    "${DISCOVERY_PREFIX}/sensor/${ID}_gpu_temp/config" \
+    "${DISCOVERY_PREFIX}/sensor/${ID}_gpu_temp_source/config" \
+    "${DISCOVERY_PREFIX}/sensor/${ID}_gpu_temp_status/config"; do
+    mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASSWORD" -r -n -t "$t"
+  done
+  # State topics (GPU)
+  for t in gpu_temp gpu_temp_source gpu_temp_status; do
+    mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASSWORD" -r -n -t "${MQTT_BASE_TOPIC}/sensors/${t}"
+  done
+}
+ 
+######################################
+# Converters: dwebp | magick | convert | ffmpeg
+######################################
+_convert_webp_to_png() {
+  local in="$1" out
+  out="$(mktemp -p "$TMP_DIR" media_XXXXXX.png)"
+  if command -v dwebp >/dev/null 2>&1; then dwebp "$in" -o "$out" >/dev/null 2>&1 && {
+    echo "$out"
+    return 0
+  }; fi
+  if command -v magick >/dev/null 2>&1; then magick "$in" "$out" >/dev/null 2>&1 && {
+    echo "$out"
+    return 0
+  }; fi
+  if command -v convert >/dev/null 2>&1; then convert "$in" "$out" >/dev/null 2>&1 && {
+    echo "$out"
+    return 0
+  }; fi
+  if command -v ffmpeg >/dev/null 2>&1; then ffmpeg -y -loglevel error -i "$in" "$out" >/dev/null 2>&1 && {
+    echo "$out"
+    return 0
+  }; fi
+  return 1
+}
+_maybe_convert_to_png() {
+  local in="$1" ext="${1##*.}"
+  case "${ext,,}" in
+  webp)
+    local out
+    out="$(_convert_webp_to_png "$in")" || {
+      _dbg "CONVERT_MISSING $in"
+      echo "$in"
+      return 0
+    }
+    _dbg "CONVERTED_WEBP $in -> $out"
+    echo "$out"
+    ;;
+  *) echo "$in" ;;
+  esac
+}
+ 
+######################################
+# Media discovery (box-art + marquee)
+######################################
+_resolve_real_sys_and_rel() {
+  local sys="$1" romp="$2" real_sys rel_path
+  real_sys="$sys"
+  if [[ "$romp" == /userdata/roms/* ]]; then
+    local rest="${romp#/userdata/roms/}"
+    real_sys="${rest%%/*}"
+    rel_path="./${rest#*/}"
+  else
+    rel_path="./$(basename "$romp")"
+  fi
+  echo "${real_sys}|${rel_path}"
+}
+
+_gamelist_get_tag() {
+  local sys="$1" rel="$2" tag="$3" gl
+  gl="/userdata/roms/$sys/gamelist.xml"
+  [ -f "$gl" ] || return 1
+  awk -v p="$rel" -v t="$tag" '
+    index($0, "<path>" p "</path>") { inside=1 }
+    inside && index($0, "<" t ">") {
+      sub(".*<" t ">", ""); sub("</" t ">.*", ""); print; exit
+    }
+    inside && /<\/game>/ { inside=0 }
+  ' "$gl"
+}
+
+_find_game_image() {
+  local sys="$1" romp="$2" romn="$3" base stem name sr real_sys rel_path line candidate
+  sr="$(_resolve_real_sys_and_rel "$sys" "$romp")"
+  real_sys="${sr%%|*}"
+  rel_path="${sr#*|}"
+  base="$(basename "$romp")"
+  stem="${base%.*}"
+  name="$romn"
+  # 1) roms/<system>/images (prefer -thumb/-box/-image, then media/images)
+  for ext in webp png jpg jpeg JPG JPEG PNG; do
+    for candidate in \
+      "/userdata/roms/$real_sys/images/${stem}-thumb.$ext" \
+      "/userdata/roms/$real_sys/images/${stem}-box.$ext" \
+      "/userdata/roms/$real_sys/images/${stem}-image.$ext" \
+      "/userdata/roms/$real_sys/images/${stem}.$ext" \
+      "/userdata/roms/$real_sys/images/${name//\//-}-thumb.$ext" \
+      "/userdata/roms/$real_sys/images/${name//\//-}-box.$ext" \
+      "/userdata/roms/$real_sys/images/${name//\//-}-image.$ext" \
+      "/userdata/roms/$real_sys/images/${name//\//-}.$ext" \
+      "/userdata/roms/$real_sys/media/images/${stem}.$ext" \
+      "/userdata/roms/$real_sys/media/images/${name//\//-}.$ext"; do [ -f "$candidate" ] && echo "$candidate" && return 0; done
+  done
+  # 2) downloaded_images/<system>
+  for root in "/userdata/system/configs/emulationstation/downloaded_images/$real_sys" "$HOME/.emulationstation/downloaded_images/$real_sys"; do
+    [ -d "$root" ] || continue
+    for ext in webp png jpg jpeg JPG JPEG PNG; do
+      for candidate in \
+        "$root/${name//\//-}-thumb.$ext" \
+        "$root/${stem}-thumb.$ext" \
+        "$root/${name//\//-}-image.$ext" \
+        "$root/${name//\//-}.$ext" \
+        "$root/${stem}-image.$ext" \
+        "$root/${stem}.$ext"; do [ -f "$candidate" ] && echo "$candidate" && return 0; done
+    done
+  done
+  # 3) <thumbnail> or <image> in gamelist.xml
+  for tag in thumbnail image; do
+    line="$(_gamelist_get_tag "$real_sys" "$rel_path" "$tag")"
+    if [ -n "$line" ]; then
+      line="${line/#\~/$HOME}"
+      case "$line" in ./*) line="/userdata/roms/$real_sys/${line#./}" ;; esac
+      [ -f "$line" ] && echo "$line" && return 0
+    fi
+  done
+  return 1
+}
+
+_find_marquee_image() {
+  local sys="$1" romp="$2" romn="$3" base stem name sr real_sys rel_path line candidate
+  sr="$(_resolve_real_sys_and_rel "$sys" "$romp")"
+  real_sys="${sr%%|*}"
+  rel_path="${sr#*|}"
+  base="$(basename "$romp")"
+  stem="${base%.*}"
+  name="$romn"
+  # 1) roms/<system>/images (accept -marquee/-wheel/-logo, then media/images)
+  for ext in webp png jpg jpeg JPG JPEG PNG; do
+    for candidate in \
+      "/userdata/roms/$real_sys/images/${stem}-marquee.$ext" \
+      "/userdata/roms/$real_sys/images/${name//\//-}-marquee.$ext" \
+      "/userdata/roms/$real_sys/images/${stem}-wheel.$ext" \
+      "/userdata/roms/$real_sys/images/${name//\//-}-wheel.$ext" \
+      "/userdata/roms/$real_sys/images/${stem}-logo.$ext" \
+      "/userdata/roms/$real_sys/images/${name//\//-}-logo.$ext" \
+      "/userdata/roms/$real_sys/media/images/${stem}.$ext" \
+      "/userdata/roms/$real_sys/media/images/${name//\//-}.$ext"; do [ -f "$candidate" ] && echo "$candidate" && return 0; done
+  done
+  # 2) downloaded_images/<system>
+  for root in "/userdata/system/configs/emulationstation/downloaded_images/$real_sys" "$HOME/.emulationstation/downloaded_images/$real_sys"; do
+    [ -d "$root" ] || continue
+    for ext in webp png jpg jpeg JPG JPEG PNG; do
+      for candidate in \
+        "$root/${name//\//-}-marquee.$ext" \
+        "$root/${stem}-marquee.$ext" \
+        "$root/${name//\//-}-wheel.$ext" \
+        "$root/${stem}-wheel.$ext" \
+        "$root/${name//\//-}-logo.$ext" \
+        "$root/${stem}-logo.$ext"; do [ -f "$candidate" ] && echo "$candidate" && return 0; done
+    done
+  done
+  # 3) <marquee> or <image> in gamelist.xml
+  for tag in marquee image; do
+    line="$(_gamelist_get_tag "$real_sys" "$rel_path" "$tag")"
+    if [ -n "$line" ]; then
+      line="${line/#\~/$HOME}"
+      case "$line" in ./*) line="/userdata/roms/$real_sys/${line#./}" ;; esac
+      [ -f "$line" ] && echo "$line" && return 0
+    fi
+  done
+  return 1
+}
+ 
+_publish_file_variants() {
+  local kind="$1" fp="$2" ext
+  [ -f "$fp" ] || {
+    _dbg "NOT_FOUND $kind $fp"
+    return 1
+  }
+  ext="${fp##*.}"
+  if [ "${ext,,}" = "webp" ]; then
+    local conv
+    conv="$(_maybe_convert_to_png "$fp")"
+    fp="$conv"
+  fi
+  _pub_event "${MQTT_BASE_TOPIC}/emulationstation/game-selected/${kind}_path" "$fp"
+  _pub_file "${MQTT_BASE_TOPIC}/emulationstation/game-selected/${kind}_bytes" "$fp"
+  if [ "$PUBLISH_IMAGE_B64" -eq 1 ] && command -v base64 >/dev/null 2>&1; then
+    base64 "$fp" | tr -d '\n' | mosquitto_pub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASSWORD" \
+      -t "${MQTT_BASE_TOPIC}/emulationstation/game-selected/${kind}_b64" -s
+  fi
+}
+ 
+_publish_media_for_selection() {
+  local sys="$1" romp="$2" romn="$3" fp
+  fp="$(_find_game_image "$sys" "$romp" "$romn")" && _publish_file_variants "image" "$fp" || _dbg "NO_IMAGE $sys $romp"
+  fp="$(_find_marquee_image "$sys" "$romp" "$romn")" && _publish_file_variants "marquee" "$fp" || _dbg "NO_MARQUEE $sys $romp"
+}
+ 
+######################################
+# Core publish
+######################################
+publish() {
+  local subtopic="$1"
+  shift
+  local data ts
+  data=$(_json_array_from_args "$@")
+  ts=$(_ts)
+  _pub "${MQTT_BASE_TOPIC}/${subtopic}" "{\"data\": ${data}, \"timestamp\": \"${ts}\"}"
+  case "$subtopic" in
+  emulationstation/game-start)
+    local rom_path rom_name sr real_sys rel_path pretty_name
+    if [ "$HAS_JQ" -eq 1 ]; then
+      rom_path=$(jq -r '.[0] // empty' <<<"$data")
+      rom_name=$(jq -r '.[2] // .[1] // .[0]' <<<"$data")
+    else
+      rom_path="${1:-}"
+      rom_name="${3:-${2:-$rom_path}}"
+    fi
+    sr="$(_resolve_real_sys_and_rel "" "$rom_path")"
+    real_sys="${sr%%|*}"
+    rel_path="${sr#*|}"
+    pretty_name="$(_gamelist_get_tag "$real_sys" "$rel_path" "name")"
+    [ -n "$pretty_name" ] && pretty_name="${pretty_name//&amp;/&}" && rom_name="$pretty_name"
+    [ -n "$real_sys" ] && _pub_str "${MQTT_BASE_TOPIC}/emulationstation/system" "$real_sys"
+    [ -n "$rom_name" ] && _pub_str "${MQTT_BASE_TOPIC}/emulationstation/rom" "$rom_name"
+    _pub_str "${MQTT_BASE_TOPIC}/emulationstation/state" "playing"
+    [ -n "$rom_path" ] && _publish_media_for_selection "$real_sys" "$rom_path" "$rom_name"
+    ;;
+  emulationstation/game-end | game/gameStop | emulationstation/quit | emulationstation/reboot | emulationstation/shutdown | system/shutdown | emulationstation/screensaver-stop | emulationstation/sleep | emulationstation/wake)
+    _pub_str "${MQTT_BASE_TOPIC}/emulationstation/state" "menu"
+    _pub_str "${MQTT_BASE_TOPIC}/emulationstation/rom" ""
+    ;;
+  emulationstation/system-selected)
+    local sys
+    if [ "$HAS_JQ" -eq 1 ]; then sys=$(jq -r '.[0] // empty' <<<"$data"); else sys="${1:-}"; fi
+    [ -n "$sys" ] && _pub_str "${MQTT_BASE_TOPIC}/emulationstation/system" "$sys"
+    ;;
+  emulationstation/game-selected)
+    local sys romp rom_name ts_local
+    ts_local="$(_local_ts)"
+    if [ "$HAS_JQ" -eq 1 ]; then
+      sys=$(jq -r '.[0] // empty' <<<"$data")
+      romp=$(jq -r '.[1] // empty' <<<"$data")
+      rom_name=$(jq -r '.[2] // .[1] // .[0]' <<<"$data")
+    else
+      sys="${1:-}"
+      romp="${2:-}"
+      rom_name="${3:-${2:-$1}}"
+    fi
+    [ -n "$sys" ] && _pub_str "${MQTT_BASE_TOPIC}/emulationstation/system" "$sys"
+    [ -n "$rom_name" ] && _pub_str "${MQTT_BASE_TOPIC}/emulationstation/rom" "$rom_name"
+    if [ "$HAS_JQ" -eq 1 ]; then
+      _pub_event "${MQTT_BASE_TOPIC}/emulationstation/game-selected/pretty" "$(jq -n --argjson data "$data" --arg ts "$ts" '{data:$data, timestamp:$ts}')"
+    else
+      _pub_event "${MQTT_BASE_TOPIC}/emulationstation/game-selected/pretty" "{\"data\": ${data}, \"timestamp\": \"${ts}\"}"
+    fi
+    _pub_event "${MQTT_BASE_TOPIC}/emulationstation/game-selected/human_ts" "$ts_local"
+    _pub_event "${MQTT_BASE_TOPIC}/emulationstation/game-selected/compact" "{\"data\": ${data}, \"timestamp\": \"${ts}\"}"
+    _publish_media_for_selection "$sys" "$romp" "$rom_name"
+    ;;
+  game/gameStart)
+    local sys
+    if [ "$HAS_JQ" -eq 1 ]; then sys=$(jq -r '.[0] // empty' <<<"$data"); else sys="${1:-}"; fi
+    [ -n "$sys" ] && _pub_str "${MQTT_BASE_TOPIC}/emulationstation/system" "$sys"
+    _pub_str "${MQTT_BASE_TOPIC}/emulationstation/state" "playing"
+    ;;
+  esac
+}
+ 
+######################################
+# HA MQTT Discovery (images + CPU telemetry only)
+######################################
+ha_discover() {
+  local ID="batocera_${HOSTNAME}"
+ 
+  # CPU/system sensors
+  declare -A SENS=([cpu_temp]="°C" [cpu_load]="%" [ram_used]="MB" [disk_used]="%" [uptime]="s")
+  for key in cpu_temp cpu_load ram_used disk_used uptime; do
+    _pub "${DISCOVERY_PREFIX}/sensor/${ID}_${key}/config" \
+      "{
+        \"name\": \"${key//_/ }\",
+        \"unique_id\": \"${ID}_${key}\",
+        \"state_topic\": \"${MQTT_BASE_TOPIC}/sensors/${key}\",
+        \"unit_of_measurement\": \"${SENS[$key]}\",
+        \"availability_topic\": \"${MQTT_BASE_TOPIC}/availability\",
+        \"device\": {\"identifiers\":[\"${ID}\"],\"name\":\"${HOSTNAME}\"}
+      }"
+  done
+ 
+  # Diagnostics for CPU temp
+  for diag in cpu_temp_source cpu_temp_status; do
+    _pub "${DISCOVERY_PREFIX}/sensor/${ID}_${diag}/config" \
+      "{
+        \"name\": \"${diag//_/ }\",
+        \"unique_id\": \"${ID}_${diag}\",
+        \"state_topic\": \"${MQTT_BASE_TOPIC}/sensors/${diag}\",
+        \"icon\": \"mdi:information\",
+        \"availability_topic\": \"${MQTT_BASE_TOPIC}/availability\",
+        \"device\": {\"identifiers\":[\"${ID}\"],\"name\":\"${HOSTNAME}\"}
+      }"
+  done
+ 
+  # Now Playing / System / Playing
+  _pub "${DISCOVERY_PREFIX}/sensor/${ID}_now_playing/config" \
+    "{
+      \"name\":\"now playing\",
+      \"unique_id\":\"${ID}_now_playing\",
+      \"state_topic\":\"${MQTT_BASE_TOPIC}/emulationstation/rom\",
+      \"availability_topic\":\"${MQTT_BASE_TOPIC}/availability\",
+      \"icon\":\"mdi:gamepad-variant\",
+      \"device\": {\"identifiers\":[\"${ID}\"]}
+    }"
+  _pub "${DISCOVERY_PREFIX}/sensor/${ID}_system/config" \
+    "{
+      \"name\":\"system\",
+      \"unique_id\":\"${ID}_system\",
+      \"state_topic\":\"${MQTT_BASE_TOPIC}/emulationstation/system\",
+      \"availability_topic\":\"${MQTT_BASE_TOPIC}/availability\",
+      \"icon\":\"mdi:chip\",
+      \"device\": {\"identifiers\":[\"${ID}\"]}
+    }"
+  _pub "${DISCOVERY_PREFIX}/binary_sensor/${ID}_playing/config" \
+    "{
+      \"name\":\"playing\",
+      \"unique_id\":\"${ID}_playing\",
+      \"state_topic\":\"${MQTT_BASE_TOPIC}/emulationstation/state\",
+      \"payload_on\":\"playing\",
+      \"payload_off\":\"menu\",
+      \"device_class\":\"running\",
+      \"availability_topic\":\"${MQTT_BASE_TOPIC}/availability\",
+      \"device\": {\"identifiers\":[\"${ID}\"]}
+    }"
+ 
+  # Buttons
+  for cmd in reboot shutdown; do
+    _pub "${DISCOVERY_PREFIX}/button/${ID}_${cmd}/config" \
+      "{
+        \"name\":\"${cmd^} ${HOSTNAME}\",
+        \"unique_id\":\"${ID}_${cmd}\",
+        \"command_topic\":\"${MQTT_BASE_TOPIC}/command\",
+        \"payload_press\":\"${cmd}\",
+        \"availability_topic\":\"${MQTT_BASE_TOPIC}/availability\",
+        \"icon\":\"mdi:${cmd}\",
+        \"device\": {\"identifiers\":[\"${ID}\"]}
+      }"
+  done
+ 
+  # Images
+  _pub "${DISCOVERY_PREFIX}/image/${HOSTNAME}/boxart/config" \
+    "{
+      \"name\": \"box art\",
+      \"unique_id\": \"${ID}_boxart\",
+      \"image_topic\": \"${MQTT_BASE_TOPIC}/emulationstation/game-selected/image_bytes\",
+      \"availability_topic\": \"${MQTT_BASE_TOPIC}/availability\",
+      \"device\": {\"identifiers\":[\"${ID}\"],\"name\":\"${HOSTNAME}\"}
+    }"
+  _pub "${DISCOVERY_PREFIX}/image/${HOSTNAME}/marquee/config" \
+    "{
+      \"name\": \"marquee\",
+      \"unique_id\": \"${ID}_marquee\",
+      \"image_topic\": \"${MQTT_BASE_TOPIC}/emulationstation/game-selected/marquee_bytes\",
+      \"availability_topic\": \"${MQTT_BASE_TOPIC}/availability\",
+      \"device\": {\"identifiers\":[\"${ID}\"],\"name\":\"${HOSTNAME}\"}
+    }"
+}
+ 
+######################################
+# CPU temperature
+######################################
+CPU_TEMP_SAMPLE_COUNT=3
+CPU_TEMP_SAMPLE_DELAY_MS=150
+CPU_TEMP_STICKY_SECONDS=600
+CPU_TEMP_MIN_VALID=-40
+CPU_TEMP_MAX_VALID=125
+ 
+_norm_celsius() {
+  local v="$1"
+  [ -z "$v" ] && return 1
+  v="$(echo "$v" | tr -d '[:space:]')"
+  case "$v" in '' | *[!0-9-]*) return 1 ;; esac
+  if [ "$v" -ge 1000 ] || [ "$v" -le -1000 ]; then echo $((v / 1000)); else echo "$v"; fi
+}
+_is_valid_temp() {
+  local c="$1"
+  [ -z "$c" ] && return 1
+  [ "$c" -lt "$CPU_TEMP_MIN_VALID" ] && return 1
+  [ "$c" -gt "$CPU_TEMP_MAX_VALID" ] && return 1
+  return 0
+}
+_sleep_ms() { usleep "$(($1 * 1000))" 2>/dev/null || sleep "$(awk "BEGIN{print $1/1000}")"; }
+ 
+_resolve_coretemp_path() {
+  # Use cached path if still valid
+  if [ -f "$CORETEMP_PATH_CACHE" ]; then
+    local p
+    p="$(cat "$CORETEMP_PATH_CACHE" 2>/dev/null)"
+    [ -n "$p" ] && [ -f "$p" ] && echo "$p" && return 0
+  fi
+  # Scan for 'coretemp' hwmon and select Package/Physical/CPU label; else first found
+  for h in /sys/class/hwmon/hwmon*; do
+    [ -f "$h/name" ] || continue
+    local name
+    name="$(cat "$h/name" 2>/dev/null)"
+    case "${name,,}" in *temp* | *thermal*)
+      local first=""
+      for n in "$h"/temp*_input; do
+        [ -f "$n" ] || continue
+        [ -z "$first" ] && first="$n"
+        local lblfile="${n%_input}_label" lbl=""
+        [ -f "$lblfile" ] && lbl="$(cat "$lblfile" 2>/dev/null)"
+        if echo "$lbl" | grep -qiE 'package|physical|cpu'; then
+          echo "$n" | tee "$CORETEMP_PATH_CACHE"
+          return 0
+        fi
+      done
+      if [ -n "$first" ]; then
+        echo "$first" | tee "$CORETEMP_PATH_CACHE"
+        return 0
+      fi
+      ;;
+    esac
+  done
+  return 1
+}
+ 
+_read_coretemp_once() {
+  local p
+  p="$(_resolve_coretemp_path)" || return 1
+  local raw
+  raw="$(cat "$p" 2>/dev/null)" || return 1
+  local c
+  c="$(_norm_celsius "$raw")" || return 1
+  echo "$c"
+  return 0
+}
+ 
+_sample_coretemp_median() {
+  local n="${CPU_TEMP_SAMPLE_COUNT:-3}" d="${CPU_TEMP_SAMPLE_DELAY_MS:-150}"
+  local vals=() i=0 v
+  while [ $i -lt "$n" ]; do
+    v="$(_read_coretemp_once)" || {
+      _sleep_ms "$d"
+      i=$((i + 1))
+      continue
+    }
+    vals+=("$v")
+    i=$((i + 1))
+    [ $i -lt "$n" ] && _sleep_ms "$d"
+  done
+  [ "${#vals[@]}" -eq 0 ] && return 1
+  IFS=$'\n' vals=($(printf "%s\n" "${vals[@]}" | sort -n))
+  unset IFS
+  local mid=$(((${#vals[@]} - 1) / 2))
+  echo "${vals[$mid]}"
+  return 0
+}
+ 
+_publish_cpu_temp() {
+  local now c last_c last_src last_ts sticky_src sticky_until
+  now="$(date +%s)"
+  [ -f "$CPU_TEMP_STATE_FILE" ] && IFS=';' read -r last_c last_src last_ts sticky_src sticky_until <"$CPU_TEMP_STATE_FILE"
+ 
+  c="$(_sample_coretemp_median)" || c=""
+ 
+  if _is_valid_temp "$c"; then
+    _pub_str "${MQTT_BASE_TOPIC}/sensors/cpu_temp" "$c"
+    _pub_str "${MQTT_BASE_TOPIC}/sensors/cpu_temp_source" "hwmon:coretemp"
+    _pub_str "${MQTT_BASE_TOPIC}/sensors/cpu_temp_status" "valid"
+    local until=$((now + CPU_TEMP_STICKY_SECONDS))
+    echo "${c};hwmon:coretemp;${now};hwmon:coretemp;${until}" >"$CPU_TEMP_STATE_FILE"
+  else
+    if _is_valid_temp "$last_c"; then
+      _pub_str "${MQTT_BASE_TOPIC}/sensors/cpu_temp" "$last_c"
+      _pub_str "${MQTT_BASE_TOPIC}/sensors/cpu_temp_source" "${last_src:-hwmon:coretemp}"
+      _pub_str "${MQTT_BASE_TOPIC}/sensors/cpu_temp_status" "stale"
+    else
+      _dbg "CPU_TEMP_UNAVAILABLE (coretemp not found or unreadable)"
+    fi
+  fi
+}
+ 
+######################################
+# Command listener
+######################################
+listen_commands() {
+  mosquitto_sub -h "$MQTT_HOST" -p "$MQTT_PORT" -u "$MQTT_USER" -P "$MQTT_PASSWORD" \
+    -t "${MQTT_BASE_TOPIC}/command" -q 0 | while read -r payload; do
+    case "$payload" in
+    reboot) reboot ;;
+    shutdown) shutdown -h now ;;
+    esac
+  done &
+  CMD_PID=$!
+}
+ 
+######################################
+# Telemetry loop
+######################################
+telemetry_loop() {
+  [ "$TELEMETRY_ENABLE" -eq 1 ] || return 0
+  while true; do
+    _publish_cpu_temp
+ 
+    # CPU load (1min)
+    [ -r /proc/loadavg ] && _pub_str "${MQTT_BASE_TOPIC}/sensors/cpu_load" "$(awk '{print $1}' /proc/loadavg)"
+ 
+    # RAM used (MB)
+    if [ -r /proc/meminfo ]; then
+      local mt ma
+      mt="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
+      ma="$(awk '/MemAvailable:/ {print $2}' /proc/meminfo)"
+      [ -n "$mt" ] && [ -n "$ma" ] && _pub_str "${MQTT_BASE_TOPIC}/sensors/ram_used" $(((mt - ma) / 1024))
+    fi
+ 
+    # Disk used (% of /userdata)
+    if df -P /userdata >/dev/null 2>&1; then
+      local du
+      du="$(df -P /userdata | awk 'NR==2{gsub(/%/,"",$5);print $5}')"
+      [ -n "$du" ] && _pub_str "${MQTT_BASE_TOPIC}/sensors/disk_used" "$du"
+    fi
+ 
+    # Uptime (s)
+    [ -r /proc/uptime ] && _pub_str "${MQTT_BASE_TOPIC}/sensors/uptime" "$(awk '{print int($1)}' /proc/uptime)"
+ 
+    sleep "$TELEMETRY_INTERVAL"
+  done &
+  TEL_PID=$!
+}
+ 
+######################################
+# Install / Uninstall ES hooks
+######################################
+install() {
+  mkdir -p /userdata/system/configs/emulationstation/scripts
+  for event in "${ES_EVENTS[@]}"; do
+    local script_dir="/userdata/system/configs/emulationstation/scripts/${event}"
+    mkdir -p "$script_dir"
+    local script="${script_dir}/${SERVICE_NAME%.sh}.sh"
+    if [ ! -f "$script" ]; then
+      cat >"$script" <<'EOF'
+#!/bin/bash
+event_name="$(basename "$(dirname "$0")")"
+/userdata/system/services/SERVICE_NAME publish "emulationstation/${event_name}" "$@"
+EOF
+      sed -i "s/SERVICE_NAME/${SERVICE_NAME}/" "$script"
+      chmod +x "$script"
+    fi
+  done
+ 
+  mkdir -p /userdata/system/scripts
+  local game_script="/userdata/system/scripts/${SERVICE_NAME%.sh}.sh"
+  if [ ! -f "$game_script" ]; then
+    cat >"$game_script" <<'EOF'
+#!/bin/bash
+# Args: gameStart|gameStop system emulator core rompath
+/userdata/system/services/SERVICE_NAME publish "game/$1" "${@:2}"
+EOF
+    sed -i "s/SERVICE_NAME/${SERVICE_NAME}/" "$game_script"
+    chmod +x "$game_script"
+  fi
+}
+uninstall() {
+  for event in "${ES_EVENTS[@]}"; do
+    local script_dir="/userdata/system/configs/emulationstation/scripts/${event}"
+    local script="${script_dir}/${SERVICE_NAME%.sh}.sh"
+    [ -f "$script" ] && rm -f "$script"
+    [ -d "$script_dir" ] && [ -z "$(ls -A "$script_dir")" ] && rmdir "$script_dir" 2>/dev/null
+  done
+  rm -f "/userdata/system/scripts/${SERVICE_NAME%.sh}.sh"
+}
+ 
+######################################
+# Process Control
+######################################
+getMPID() {
+  X=$(cat "${PIDFILE}" 2>/dev/null)
+  test -z "${X}" && echo "" && return 1
+  if test -e "/proc/${X}"; then
+    echo "${X}"
+    return 0
+  fi
+  echo ""
+  return 1
+}
+ 
+######################################
+# Start / Stop
+######################################
+start() {
+  P=$(getMPID)
+  if test -n "$P"; then
+    kill "$P"
+  fi
+  echo $$ >"${PIDFILE}"
+  install
+  _pub_str "${MQTT_BASE_TOPIC}/availability" "online"
+  publish "system/startup"
+  ha_discover
+  listen_commands
+  telemetry_loop
+}
+stop() {
+  P=$(getMPID)
+  if test -n "$P"; then
+    kill "$P"
+  fi
+  /bin/rm "${PIDFILE}"
+  publish "system/shutdown"
+  [ -n "$CMD_PID" ] && kill "$CMD_PID" 2>/dev/null
+  [ -n "$TEL_PID" ] && kill "$TEL_PID" 2>/dev/null
+  _pub_str "${MQTT_BASE_TOPIC}/availability" "offline"
+}
+ 
+######################################
+# Entrypoint
+######################################
+if [ $# -eq 0 ]; then
+  echo "Usage: $SERVICE_NAME publish|start|stop|install|uninstall [args...]"
+  exit 1
+fi
+case "$1" in
+publish)
+  shift
+  publish "$@"
+  ;;
+start) start ;;
+stop) stop ;;
+install) install ;;
+uninstall) uninstall ;;
+*)
+  echo "Unknown command: $1"
+  exit 1
+  ;;
+esac
